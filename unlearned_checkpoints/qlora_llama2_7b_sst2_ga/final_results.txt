@@ -1,0 +1,18 @@
+Total training time (s): 127.1
+eval_train_retain_loss: nan
+eval_train_retain_f1: 0.0
+eval_train_retain_accuracy: 0.0
+eval_train_retain_precision: 0.0
+eval_train_retain_recall: 0.0
+eval_train_retain_runtime: 1165.6942
+eval_train_retain_samples_per_second: 39.745
+eval_train_retain_steps_per_second: 4.969
+epoch: 1.0
+eval_train_forget_loss: nan
+eval_train_forget_f1: 0.0
+eval_train_forget_accuracy: 0.0
+eval_train_forget_precision: 0.0
+eval_train_forget_recall: 0.0
+eval_train_forget_runtime: 47.5893
+eval_train_forget_samples_per_second: 29.944
+eval_train_forget_steps_per_second: 3.761

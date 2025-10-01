@@ -1,0 +1,10 @@
+datasets
+evaluate
+peft
+scikit-learn
+torch
+torchinfo
+transformers
+trl
+bitsandbytes
+wandb

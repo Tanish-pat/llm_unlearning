@@ -1,0 +1,12 @@
+dataset: sst2
+model_checkpoints: checkpoints/qlora_llama2_7b_sst2
+unlearn_method: gradient_ascent
+logits_path: None
+output_path: unlearned_checkpoints/qlora_llama2_7b_sst2_ga
+max_length: 512
+set_pad_id: False
+lr: 0.0001
+train_batch_size: 8
+eval_batch_size: 8
+num_epochs: 1
+weight_decay: 0.001

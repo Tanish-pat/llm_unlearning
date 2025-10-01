@@ -1,0 +1,1221 @@
+# python3 qlora.py --dataset sst2 --model_name meta-llama/Llama-2-7b-hf --output_path checkpoints/qlora_llama2_7b_sst2 --train_batch_size 8 --eval_batch_size 8 --num_epochs 1 --max_length 32 --gradient_accumulation_steps 8 --save_every_epoch
+# qlora.py
+import os
+import time
+import glob
+from argparse import ArgumentParser
+from tqdm import tqdm
+
+import torch
+torch.backends.cudnn.benchmark = True
+
+from torch.utils.data import DataLoader
+from torchinfo import summary
+from datasets import concatenate_datasets, DatasetDict, load_dataset
+from peft import get_peft_model, PeftConfig, PeftModel, LoraConfig, TaskType
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+try:
+    from trl import DataCollatorForCompletionOnly as _TRL_DataCollator
+    _HAS_TRL_COLLATOR = True
+except Exception:
+    _TRL_DataCollator = None
+    _HAS_TRL_COLLATOR = False
+
+from utils import get_data_path, compute_metrics, preprocess_logits_for_metrics, CustomCallback, CompletionOnlyCollator
+
+# small memory helper
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")  # reduce fragmentation (may help)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # suppress warnings
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")  # disable telemetry
+
+def get_args():
+    parser = ArgumentParser(description="Fine-tune a large LLM with QLoRA (4-bit) + PEFT (manual loop)")
+    parser.add_argument("--dataset", type=str, required=True, help="Dataset name (sst2 or yelp)")
+    parser.add_argument("--model_name", type=str, required=True, help="HF model ID (e.g. meta-llama/Llama-2-7b-hf)")
+    parser.add_argument("--output_path", type=str, default="checkpoints/qlora_model", help="Save path")
+    parser.add_argument("--max_length", type=int, default=1024, help="Max sequence length")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--train_batch_size", type=int, default=1, help="Train batch size (GPU-safe)")
+    parser.add_argument("--eval_batch_size", type=int, default=1, help="Eval batch size (GPU-safe)")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--lora_bias", type=str, default="none", choices={"lora_only", "none", "all"}, help="LoRA bias mode")
+    parser.add_argument("--save_every_epoch", action="store_true", help="Save checkpoint after each epoch")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps (use to emulate larger batch sizes)")
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader num_workers")
+    return parser.parse_args()
+
+
+def get_lora_model(model_name, rank=8, alpha=32, lora_dropout=0.1, bias="none"):
+    """
+    Load model and tokenizer. If CUDA available, attempt 4-bit loading via bitsandbytes.
+    Returns: (model, tokenizer, peft_config)
+    """
+    use_cuda = torch.cuda.is_available()
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    if use_cuda:
+        bnb_config = BitsAndBytesConfig(
+            # load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            trust_remote_code=True,
+            quantization_config=bnb_config,
+            use_safetensors=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=alpha,
+        lora_dropout=lora_dropout,
+        bias=bias,
+    )
+    return model, tokenizer, peft_config
+
+
+def _load_parquet_split_files(dirpath, pattern):
+    files = sorted(glob.glob(os.path.join(dirpath, pattern)))
+    if not files:
+        return None
+    ds = None
+    for f in files:
+        part = load_dataset("parquet", data_files=f)["train"]
+        ds = part if ds is None else concatenate_datasets([ds, part])
+    return ds
+
+
+def get_unlearn_dataset_and_collator(data_path, tokenizer, max_length=1024):
+    prompt_template = lambda text, label: f"""### Text: {text}\n\n### Question: What is the sentiment?\n\n### Sentiment: {label}"""
+
+    def _preprocess(examples):
+        return {"text": prompt_template(examples["text"], examples.get("label_text", str(examples.get("label", ""))))}
+
+    response_template = "\n### Sentiment:"
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+
+    if _HAS_TRL_COLLATOR and _TRL_DataCollator is not None:
+        collator = _TRL_DataCollator(response_template_ids, tokenizer=tokenizer)
+    else:
+        collator = CompletionOnlyCollator(response_template_ids, tokenizer=tokenizer, max_length=max_length)
+
+    raw = load_dataset(data_path)
+
+    # Normalize to a DatasetDict with expected keys
+    if all(k in raw for k in ("train_retain", "train_forget", "test_retain", "test_forget")):
+        dataset = DatasetDict({
+            "train_retain": raw["train_retain"],
+            "train_forget": raw["train_forget"],
+            "test_retain": raw["test_retain"],
+            "test_forget": raw["test_forget"],
+        })
+    else:
+        if "train" in raw and "test" in raw:
+            train = raw["train"]
+            test = raw["test"]
+            if "is_forget" in train.column_names:
+                train_retain = train.filter(lambda x: x["is_forget"] in (0, False))
+                train_forget = train.filter(lambda x: x["is_forget"] in (1, True))
+                test_retain = test.filter(lambda x: x["is_forget"] in (0, False))
+                test_forget = test.filter(lambda x: x["is_forget"] in (1, True))
+            elif "subset" in train.column_names:
+                train_retain = train.filter(lambda x: x.get("subset", "") == "retain")
+                train_forget = train.filter(lambda x: x.get("subset", "") == "forget")
+                test_retain = test.filter(lambda x: x.get("subset", "") == "retain")
+                test_forget = test.filter(lambda x: x.get("subset", "") == "forget")
+            else:
+                if os.path.isdir(data_path):
+                    train_retain = _load_parquet_split_files(data_path, "train_retain*.parquet")
+                    train_forget = _load_parquet_split_files(data_path, "train_forget*.parquet")
+                    test_retain = _load_parquet_split_files(data_path, "test_retain*.parquet")
+                    test_forget = _load_parquet_split_files(data_path, "test_forget*.parquet")
+                else:
+                    train_retain = train
+                    train_forget = train.select([]) if hasattr(train, "select") else train
+                    test_retain = test
+                    test_forget = test.select([]) if hasattr(test, "select") else test
+
+                train_retain = train_retain or train
+                train_forget = train_forget or (train.select([]) if hasattr(train, "select") else train)
+                test_retain = test_retain or test
+                test_forget = test_forget or (test.select([]) if hasattr(test, "select") else test)
+
+            dataset = DatasetDict({
+                "train_retain": train_retain,
+                "train_forget": train_forget,
+                "test_retain": test_retain,
+                "test_forget": test_forget,
+            })
+        else:
+            if os.path.isdir(data_path):
+                train_retain = _load_parquet_split_files(data_path, "train_retain*.parquet") or load_dataset(data_path)["train"]
+                train_forget = _load_parquet_split_files(data_path, "train_forget*.parquet") or load_dataset(data_path)["train"].select([])
+                test_retain = _load_parquet_split_files(data_path, "test_retain*.parquet") or load_dataset(data_path)["train"].select([])
+                test_forget = _load_parquet_split_files(data_path, "test_forget*.parquet") or load_dataset(data_path)["train"].select([])
+                dataset = DatasetDict({
+                    "train_retain": train_retain,
+                    "train_forget": train_forget,
+                    "test_retain": test_retain,
+                    "test_forget": test_forget,
+                })
+            else:
+                raise RuntimeError("Unable to interpret dataset layout. Expected train/test or parquet files under the dataset dir.")
+
+    # Format and prompt-map each split
+    for split in ("train_retain", "train_forget", "test_retain", "test_forget"):
+        ds = dataset[split]
+        if "text" in ds.column_names and "label_text" in ds.column_names:
+            dataset[split] = ds.map(_preprocess, batched=False)
+        elif "text" in ds.column_names and "label" in ds.column_names:
+            def _map_label(ex):
+                return {"label_text": str(ex["label"])}
+            dataset[split] = ds.map(_map_label, batched=False)
+            dataset[split] = dataset[split].map(_preprocess, batched=False)
+        else:
+            raise RuntimeError(f"Dataset split {split} missing required columns 'text' and 'label_text'/'label'.")
+
+    # Remove original label columns and set format
+    for split in dataset:
+        cols_to_remove = [c for c in ("label", "label_text") if c in dataset[split].column_names]
+        if cols_to_remove:
+            try:
+                dataset[split] = dataset[split].remove_columns(cols_to_remove)
+            except Exception:
+                pass
+        dataset[split].set_format("torch")
+
+    return dataset, collator
+
+
+def move_batch_to_device(batch, device):
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            batch[k] = v.to(device)
+    return batch
+
+
+def main(args):
+    model, tokenizer, lora_config = get_lora_model(
+        args.model_name,
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias=args.lora_bias,
+    )
+
+    data_path = get_data_path(args.dataset)
+    dataset, collator = get_unlearn_dataset_and_collator(data_path, tokenizer, max_length=args.max_length)
+
+    os.makedirs(args.output_path, exist_ok=True)
+
+    # Attach LoRA
+    peft_model = get_peft_model(model, lora_config)
+
+    # Freeze everything and enable only LoRA params
+    for _, p in peft_model.named_parameters():
+        p.requires_grad = False
+
+    enabled = 0
+    try:
+        for p in peft_model.lora_parameters():
+            p.requires_grad = True
+            enabled += 1
+    except Exception:
+        for n, p in peft_model.named_parameters():
+            if "lora" in n or "adapter" in n:
+                p.requires_grad = True
+                enabled += 1
+
+    if enabled == 0:
+        raise RuntimeError("No LoRA parameters enabled. Inspect PEFT attach step.")
+
+    total_params = sum(p.numel() for p in peft_model.parameters())
+    trainable_params = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params:,}")
+    print(f"Trainable params (LoRA): {trainable_params:,}")
+
+    if trainable_params == 0:
+        raise RuntimeError("No trainable parameters detected. Aborting.")
+
+    # try to enable gradient checkpointing on the base model to save activation memory
+    try:
+        # prefer base_model if peft wrapper hides method
+        base = getattr(peft_model, "base_model", peft_model)
+        if hasattr(base, "gradient_checkpointing_disable"):
+            base.gradient_checkpointing_disable()
+    except Exception:
+        pass
+
+    summary(peft_model)
+
+    use_cuda = torch.cuda.is_available()
+    # determine primary device (if model uses device_map it may already be sharded)
+    try:
+        primary_device = next(peft_model.parameters()).device
+    except StopIteration:
+        primary_device = torch.device("cuda" if use_cuda else "cpu")
+    print("Primary model device:", primary_device)
+
+    # move the PEFT wrapper explicitly to the device if it's not already (safe no-op if already sharded)
+    try:
+        peft_model.to(primary_device)
+    except Exception:
+        pass
+
+    # Prepare data loaders (do tokenization + collator on the CPU and move each batch to GPU)
+    train_concat = concatenate_datasets([dataset["train_retain"], dataset["train_forget"]])
+    eval_concat = concatenate_datasets([dataset["test_retain"], dataset["test_forget"]])
+
+    train_loader = DataLoader(train_concat, batch_size=args.train_batch_size, shuffle=True,
+                              collate_fn=collator, num_workers=args.num_workers)
+    eval_loader  = DataLoader(eval_concat, batch_size=args.eval_batch_size, shuffle=False,
+                              collate_fn=collator, num_workers=args.num_workers)
+
+    params = [p for p in peft_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
+
+    accum_steps = max(1, args.gradient_accumulation_steps)
+    print("Using gradient_accumulation_steps =", accum_steps)
+
+    # Training loop (manual)
+    for epoch in range(1, args.num_epochs + 1):
+        peft_model.train()
+        epoch_loss = 0.0
+        n_steps = 0
+        start = time.perf_counter()
+
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch}")
+        optimizer.zero_grad()
+        for step, batch in pbar:
+            try:
+                batch = move_batch_to_device(batch, primary_device)
+                outputs = peft_model(**batch, return_dict=True, use_cache=False)
+                loss = getattr(outputs, "loss", None)
+                if loss is None:
+                    # fallback: try to compute cross-entropy from logits + labels
+                    logits = getattr(outputs, "logits", None)
+                    labels = batch.get("labels") if isinstance(batch, dict) else None
+                    if logits is None or labels is None:
+                        raise RuntimeError("Model did not return loss and logits/labels not available to compute it.")
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+                # scale loss for accumulation
+                loss = loss / accum_steps
+                loss.backward()
+            except torch.cuda.OutOfMemoryError as oom:
+                # try to recover gracefully and give the user hints
+                print("CUDA OOM during forward/backward. Emptying cache and trying to continue. Consider reducing batch size or max_length.")
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                # bubble up serious errors
+                raise
+
+            if (step + 1) % accum_steps == 0:
+                # gradient clipping (only trainable params)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                # track loss (unscale)
+                epoch_loss += loss.item() * accum_steps
+                n_steps += 1
+                pbar.set_postfix({"loss": f"{(epoch_loss / max(1, n_steps)):.6f}"})
+
+        epoch_time = time.perf_counter() - start
+        avg_loss = epoch_loss / max(1, n_steps)
+        print(f"Epoch {epoch} finished. avg_loss={avg_loss:.6f} steps={n_steps} time_s={epoch_time:.2f}")
+
+        # evaluation (compute loss on eval set)
+        peft_model.eval()
+        eval_loss = 0.0
+        eval_steps = 0
+        with torch.no_grad():
+            for batch in tqdm(eval_loader, desc="Eval"):
+                batch = move_batch_to_device(batch, primary_device)
+                outputs = peft_model(**batch, return_dict=True, use_cache=False)
+                loss = getattr(outputs, "loss", None)
+                if loss is None:
+                    logits = getattr(outputs, "logits", None)
+                    labels = batch.get("labels") if isinstance(batch, dict) else None
+                    if logits is None or labels is None:
+                        continue
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                eval_loss += loss.item()
+                eval_steps += 1
+        if eval_steps:
+            print(f"Epoch {epoch} eval_loss={eval_loss / eval_steps:.6f}")
+
+        # save checkpoint after epoch if requested
+        if args.save_every_epoch:
+            epoch_path = os.path.join(args.output_path, f"epoch_{epoch}")
+            os.makedirs(epoch_path, exist_ok=True)
+            try:
+                peft_model.save_pretrained(epoch_path)
+                tokenizer.save_pretrained(epoch_path)
+                print("Saved epoch checkpoint to:", epoch_path)
+            except Exception as e:
+                print("Warning: failed to save epoch checkpoint:", e)
+
+    # final save (safe merge)
+    try:
+        if hasattr(peft_model, "merge_and_unload"):
+            try:
+                base_model = peft_model.merge_and_unload()
+                base_model.save_pretrained(args.output_path)
+            except KeyError as ke:
+                # fallback: PEFT merge failed, save PEFT wrapper instead
+                print(f"Warning: merge_and_unload failed ({ke}), saving PEFT model directly.")
+                peft_model.save_pretrained(args.output_path)
+        else:
+            peft_model.save_pretrained(args.output_path)
+        tokenizer.save_pretrained(args.output_path)
+        print("Saved final PEFT model and tokenizer to:", args.output_path)
+    except Exception as e:
+        print("Warning: failed to save final model/tokenizer:", e)
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)
+
+# python3 baselines.py --dataset sst2 --model_checkpoints checkpoints/qlora_llama2_7b_sst2 --unlearn_method gradient_ascent --output_path unlearned_checkpoints/qlora_llama2_7b_sst2_ga --train_batch_size 8 --eval_batch_size 8 --num_epochs 1 --max_length 32
+# baselines.py
+import os
+from copy import deepcopy
+from argparse import ArgumentParser
+import numpy as np
+import datetime
+import time
+import pickle
+import random
+
+import torch
+from torchinfo import summary
+
+from datasets import load_dataset, concatenate_datasets
+import evaluate
+from peft import get_peft_model, PeftConfig, PeftModel, LoraConfig, TaskType
+from transformers import AutoTokenizer, TrainerState, TrainerControl, AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback, DataCollatorForLanguageModeling
+
+
+from utils import get_data_path, compute_metrics, preprocess_logits_for_metrics, get_logits_from_base_model, CustomCallback
+
+POS_WEIGHT, NEG_WEIGHT = (1.0, 1.0)
+os.environ["WANDB_DISABLED"] = "true"
+
+def get_args():
+    parser = ArgumentParser(description="Fine-tune an LLM model with PEFT")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        required=True,
+        help="name of dataset",
+    )
+    parser.add_argument(
+        "--model_checkpoints",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to checkpoints for base model to be unlearned",
+    )
+    parser.add_argument(
+        "--unlearn_method",
+        type=str,
+        default=None,
+        required=True,
+        choices={"gradient_ascent", "random_label", "gradient_ascent_kl", "gradient_ascent_descent"},
+        help="Name of baseline unlearn method"
+    )
+    parser.add_argument(
+        "--logits_path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to save original logits to use for KL loss, used by GA+KL",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to store the unlearned model",
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=1024,
+        required=False,
+        help="Maximum length of the input sequences",
+    )
+    parser.add_argument(
+        "--set_pad_id",
+        action="store_true",
+        help="Set the id for the padding token, needed by models such as Mistral-7B",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-4, help="Learning rate for training"
+    )
+    parser.add_argument(
+        "--train_batch_size", type=int, default=32, help="Train batch size"
+    )
+    parser.add_argument(
+        "--eval_batch_size", type=int, default=32, help="Eval batch size"
+    )
+    parser.add_argument(
+        "--num_epochs", type=int, default=1, help="Number of epochs"
+    )
+    parser.add_argument(
+        "--weight_decay", type=float, default=0.001, help="Weight decay"
+    )
+
+    arguments = parser.parse_args()
+    return arguments
+
+
+class CustomCallback(TrainerCallback):
+    def __init__(self, trainer) -> None:
+        super().__init__()
+        self._trainer = trainer
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if control.should_evaluate:
+            control_copy = deepcopy(control)
+            self._trainer.evaluate(eval_dataset=self._trainer.train_dataset, metric_key_prefix="train")
+            return control_copy
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if control.should_evaluate:
+            control_copy = deepcopy(control)
+            self._trainer.evaluate(eval_dataset=self._trainer.eval_dataset['train_retain'],
+                                   metric_key_prefix="eval_train_retrain")
+            self._trainer.evaluate(eval_dataset=self._trainer.eval_dataset['train_forget'],
+                                   metric_key_prefix="eval_train_forget")
+            return control_copy
+
+def get_base_model(model_checkpoints, max_length=1024):
+    """
+    Load a 4-bit QLoRA checkpoint (LoRA adapters + quantized base model) for unlearning.
+    Returns: model (PEFT), tokenizer, dummy lora_config
+    """
+    from types import SimpleNamespace
+    from peft import PeftModel, LoraConfig, get_peft_model
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    import torch
+    import os
+
+    # ----------------------
+    # Load tokenizer
+    # ----------------------
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path="meta-llama/Llama-2-7b-hf",
+        use_fast=True,
+        truncation=True,
+        padding=True,
+        max_length=max_length,
+        trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    # ----------------------
+    # QLoRA: 4-bit config
+    # ----------------------
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
+    # ----------------------
+    # Load base model
+    # ----------------------
+    base_model = AutoModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path="meta-llama/Llama-2-7b-hf",
+        device_map="auto",
+        quantization_config=quant_config,
+        trust_remote_code=True
+    )
+
+    # ----------------------
+    # Attach LoRA adapter if checkpoint exists
+    # ----------------------
+    lora_checkpoint_path = os.path.join(model_checkpoints, "epoch_1")
+    if os.path.exists(os.path.join(lora_checkpoint_path, "adapter_model.safetensors")):
+        model = PeftModel.from_pretrained(base_model, lora_checkpoint_path)
+        print(f"Loaded QLoRA checkpoint from {lora_checkpoint_path}")
+    else:
+        model = base_model
+        print(f"No LoRA checkpoint found, using base model only.")
+
+    # ----------------------
+    # Make only floating-point params trainable
+    # ----------------------
+    for n, p in model.named_parameters():
+        if p.is_floating_point():
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+
+    # ----------------------
+    # Dummy lora_config to satisfy baselines.py
+    # ----------------------
+    lora_config = SimpleNamespace()
+    lora_config.base_model_name_or_path = model_checkpoints
+    lora_config.inference_mode = False
+
+    return model, tokenizer, lora_config
+
+def make_completion_only_collator(tokenizer, response_template_ids):
+    base_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    def collator(features):
+        batch = base_collator(features)
+        labels = batch["labels"]
+
+        # Mask everything except tokens after the response template
+        for i, feature in enumerate(features):
+            input_ids = feature["input_ids"]
+
+            # Ensure tensor is on CPU for comparison
+            input_ids_cpu = input_ids.cpu() if isinstance(input_ids, torch.Tensor) and input_ids.is_cuda else input_ids
+            response_token = torch.tensor(response_template_ids[0], dtype=input_ids_cpu.dtype)
+
+            matches = (input_ids_cpu == response_token).nonzero(as_tuple=True)[0]
+            if matches.numel() > 0:
+                start = matches[0].item()
+            else:
+                start = input_ids_cpu.size(0)  # fallback: ignore all tokens
+
+            labels[i, :start] = -100  # mask tokens before response
+
+        batch["labels"] = labels
+        return batch
+
+    return collator
+
+def get_unlearn_dataset_and_collator(
+        data_path,
+        tokenizer,
+        unlearn_method,
+        col_to_delete,
+        max_length,
+        truncation,
+        add_prefix_space=True,
+):
+    prompt_template = lambda text, label: f"""### Text: {text}\n\n### Question: What is the sentiment of the given text?\n\n### Sentiment: {label}"""
+
+    def _preprocessing_sentiment(examples):
+        return tokenizer(prompt_template(examples['text'], examples['label_text']), truncation=truncation, max_length=max_length )
+
+    response_template = "\n### Sentiment:"
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)
+
+    data_collator = make_completion_only_collator(tokenizer, response_template_ids)
+
+
+    # data = load_dataset(data_path)
+    data = load_dataset(
+        "parquet",
+        data_files={
+            "train_forget": os.path.join(data_path, "train_forget_0.parquet"),
+            "train_retain": os.path.join(data_path, "train_retain_0.parquet"),
+            "test_forget": os.path.join(data_path, "test_forget_0.parquet"),
+            "test_retain": os.path.join(data_path, "test_retain_0.parquet"),
+        },
+    )
+    # Add flags to distinguish forget sets
+    if unlearn_method.lower() in ['gradient_ascent_kl', 'gradient_ascent_descent']:
+        data['train_forget'] = data['train_forget'].map(lambda item: {"is_forget": 1})
+        data['train_retain'] = data['train_retain'].map(lambda item: {"is_forget": 0})
+        data['train'] = concatenate_datasets([data['train_retain'], data['train_forget']])
+
+        data['train_forget'] = data['train_forget'].remove_columns('is_forget')
+        data['train_retain'] = data['train_retain'].remove_columns('is_forget')
+
+        data['train'] = data['train'].map(lambda item, idx: {"index": idx}, with_indices=True)
+
+    # Assign random labels to forget samples
+    if unlearn_method.lower() in ['random_label']:
+        random_labels = ['neutral', 'unknown']
+        train_forget_flip = deepcopy(data['train_forget'])
+        train_forget_flip = train_forget_flip.map(lambda item: {"label_text": random_labels[random.randint(0, len(random_labels)-1)]})
+        data['train'] = train_forget_flip
+
+        del train_forget_flip
+
+    data = data.map(_preprocessing_sentiment, batched=False)
+    data = data.remove_columns(col_to_delete)
+    data.set_format("torch")
+
+    print(data)
+
+    return data, data_collator
+
+def get_gradient_ascent_trainer():
+    class GradientAscent(Trainer):
+        def __init__(self, **kwargs):
+            # remove deprecated tokenizer arg to avoid warnings
+            kwargs.pop("tokenizer", None)
+            super().__init__(**kwargs)
+            self.name = "GA"
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            # Use model.training to detect whether we are in train() mode.
+            outputs = model(**inputs)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            # Only apply gradient ascent during training.
+            if model.training:
+                loss = -loss
+            return (loss, outputs) if return_outputs else loss
+
+    return GradientAscent
+
+
+def get_random_label_trainer():
+    class RandomLabel(Trainer):
+        def __init__(self, **kwargs):
+            kwargs.pop("tokenizer", None)
+            super().__init__(**kwargs)
+            self.name = "RL"
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            outputs = model(**inputs)
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            # No special modification for random-label baseline; behave normally
+            return (loss, outputs) if return_outputs else loss
+
+    return RandomLabel
+
+
+def get_gradient_ascent_plus_descent_trainer():
+    class GradientAscentPlusDescent(Trainer):
+        def __init__(self, **kwargs):
+            kwargs.pop("tokenizer", None)
+            super().__init__(**kwargs)
+            self.name = "GA+GD"
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.get("labels")
+            # If not training or missing forget flags, fall back to normal loss
+            if (not model.training) or ("is_forget" not in inputs) or ("index" not in inputs):
+                outputs = model(**inputs)
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                return (loss, outputs) if return_outputs else loss
+
+            # Training path: separate forget vs retain samples and do GA on forget set
+            is_forget_indicators = inputs.pop("is_forget")
+            is_retain_indicator = 1 - is_forget_indicators
+            sample_indices = inputs.pop("index")
+
+            outputs = model(**inputs)
+            logits = outputs.get("logits")
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # Select splits (safe guards if empty)
+            fgt_shift_logits = shift_logits[is_forget_indicators > 0]
+            fgt_shift_labels = shift_labels[is_forget_indicators > 0]
+            rtn_shift_logits = shift_logits[is_forget_indicators < 1]
+            rtn_shift_labels = shift_labels[is_forget_indicators < 1]
+
+            ce_loss_fct = torch.nn.CrossEntropyLoss(reduction='mean')
+            fgt_ce_loss = ce_loss_fct(
+                fgt_shift_logits.view(-1, self.model.config.vocab_size),
+                fgt_shift_labels.view(-1)
+            ) if fgt_shift_logits.numel() > 0 else torch.tensor(0.0, device=logits.device)
+
+            rtn_ce_loss = ce_loss_fct(
+                rtn_shift_logits.view(-1, self.model.config.vocab_size),
+                rtn_shift_labels.view(-1)
+            ) if rtn_shift_logits.numel() > 0 else torch.tensor(0.0, device=logits.device)
+
+            # gradient ascent on forget set (negate)
+            fgt_ce_loss = -fgt_ce_loss
+            loss = fgt_ce_loss + rtn_ce_loss
+
+            return (loss, outputs) if return_outputs else loss
+
+    return GradientAscentPlusDescent
+
+
+def get_gradient_ascent_plus_kl_trainer():
+    class GradientAscentPlusKL(Trainer):
+        def __init__(self, original_logits, **kwargs):
+            kwargs.pop("tokenizer", None)
+            super().__init__(**kwargs)
+            self.name = "GA+KL"
+            self.original_logits = original_logits
+
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.get("labels")
+
+            # If not training or missing forget flags, fall back to normal loss
+            if (not model.training) or ("is_forget" not in inputs) or ("index" not in inputs):
+                outputs = model(**inputs)
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                return (loss, outputs) if return_outputs else loss
+
+            is_forget_indicators = inputs.pop("is_forget")
+            is_retain_indicator = 1 - is_forget_indicators
+            sample_indices = inputs.pop("index")
+
+            outputs = model(**inputs)
+            logits = outputs.get("logits")
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # CE for forget set
+            fgt_shift_logits = shift_logits[is_forget_indicators > 0]
+            fgt_shift_labels = shift_labels[is_forget_indicators > 0]
+            ce_loss_fct = torch.nn.CrossEntropyLoss(reduction='mean')
+            fgt_ce_loss = ce_loss_fct(
+                fgt_shift_logits.view(-1, self.model.config.vocab_size),
+                fgt_shift_labels.view(-1)
+            ) if fgt_shift_logits.numel() > 0 else torch.tensor(0.0, device=logits.device)
+
+            # Build prev logits for the batch using same device as logits
+            device = logits.device
+            prev_logits_for_output = []
+            for idx in sample_indices:
+                # original_logits keyed by integer index -> convert with idx.item()
+                prev = torch.tensor(self.original_logits[idx.item()], device=device)
+                prev_logits_for_output.append(prev)
+
+            if len(prev_logits_for_output) == 0:
+                # no prev logits -> fallback to CE-only behavior
+                fgt_ce_loss = -fgt_ce_loss
+                return (fgt_ce_loss, outputs) if return_outputs else -fgt_ce_loss
+
+            prev_logits = torch.stack(prev_logits_for_output, dim=0)
+
+            # Keep only retain rows
+            rtn_prev_logits = prev_logits[is_retain_indicator > 0]
+            # Masked logits corresponding to output tokens
+            label_mask = labels != -100
+            rtn_logits = shift_logits[label_mask]  # flattened by mask
+            # If there are retain rows, pick corresponding positions for them
+            if rtn_prev_logits.numel() == 0 or rtn_logits.numel() == 0:
+                rtn_kl_loss = torch.tensor(0.0, device=device)
+            else:
+                # Align shapes: rtn_logits should match rtn_prev_logits in rows
+                # We'll compute KL per-token and average using batchmean
+                # Ensure shapes: (num_tokens, vocab) for both
+                # If rtn_prev_logits is shaped (N, V) and rtn_logits (M, V) but selection aligns,
+                # we assume the mapping in self.original_logits produced the same token positions.
+                kl_loss_fct = torch.nn.KLDivLoss(reduction='batchmean')
+                try:
+                    rtn_kl_loss = kl_loss_fct(
+                        torch.log_softmax(rtn_logits, dim=-1),
+                        torch.softmax(rtn_prev_logits, dim=-1)
+                    )
+                except Exception:
+                    # fallback safe zero
+                    rtn_kl_loss = torch.tensor(0.0, device=device)
+
+            # gradient ascent on forget CE
+            fgt_ce_loss = -fgt_ce_loss
+            loss = fgt_ce_loss + rtn_kl_loss
+
+            return (loss, outputs) if return_outputs else loss
+
+    return GradientAscentPlusKL
+
+def main(args):
+    # Sync wandb
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["WANDB_LOG_MODEL"] = "all"  # log your models
+
+    model_name = None
+    if 'llama2_7b' in args.model_checkpoints.lower():
+        model_name = 'llama-2-7b-hf'
+    elif 'llama2_13b' in args.model_checkpoints.lower():
+        model_name = 'llama-2-13b-hf'
+    elif 'opt-1.3b' in args.model_checkpoints.lower():
+        model_name = 'opt-1.3b'
+    else:
+        raise ValueError(f"Unsupported model checkpoint: {args.model_checkpoints}")
+
+    os.environ["WANDB_PROJECT"] = f'baseline_{model_name}_{args.dataset.lower()}'
+
+    data_path = get_data_path(args.dataset)
+
+    model, tokenizer, lora_config = get_base_model(
+        args.model_checkpoints,
+        max_length=args.max_length
+    )
+
+    dataset, collator = get_unlearn_dataset_and_collator(
+        data_path=data_path,
+        tokenizer=tokenizer,
+        unlearn_method=args.unlearn_method.lower(),
+        col_to_delete = ['text', 'label', 'label_text'],
+        max_length=args.max_length,
+        truncation=True,
+    )
+
+    if args.set_pad_id:
+        model.config.pad_token_id = model.config.eos_token_id
+
+    # move model to GPU device
+    # if model.device.type != 'cuda':
+    #     model = model.to('cuda')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    # Load logits if needed by trainer
+    if args.unlearn_method in ['gradient_ascent_kl']:
+        if args.logits_path is None:
+            args.logits_path = f'saved_logits/{model_name}_{args.dataset.lower()}-{args.forget_size}.pkl'
+
+        if not os.path.exists(args.logits_path):
+            print('Saving original logits from base model')
+            # original_logits = get_logits_from_base_model(original_model, collator, dataset)
+            original_logits = get_logits_from_base_model(model, collator, dataset)
+            torch.save(original_logits, "logits_from_"+args.model_checkpoints.split("/")[-2]+".pt")
+            original_logits = torch.load("logits_from_"+args.model_checkpoints.split("/")[-2]+".pt")
+            new_original_logits = {}
+            for k in original_logits.keys():
+                new_original_logits[k.item()] = original_logits[k].numpy()
+
+            with open(args.logits_path, 'wb') as f:
+                pickle.dump(new_original_logits, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            print('Completed saving logits from base model')
+
+        with open(args.logits_path, 'rb') as f:
+            print('Loading original logits from base model')
+            original_logits = pickle.load(f)
+
+    if args.output_path is None:
+        args.output_path = f'unlearn_checkpoints/{args.unlearn_method}_{model_name.lower()}_{args.dataset.lower()}_{datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}'
+    os.makedirs(args.output_path, exist_ok=True)
+
+    with open(os.path.join(args.output_path, 'arguments.txt'), 'w') as f:
+        for k, v in args.__dict__.items():
+            f.write(f'{k}: {v}\n')
+        print(f"Output path: {args.output_path}")
+
+
+    training_args = TrainingArguments(
+        output_dir=args.output_path,
+        learning_rate=args.lr,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.05,
+        per_device_train_batch_size=args.train_batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
+        num_train_epochs=args.num_epochs,
+        weight_decay=args.weight_decay,
+        eval_strategy="no",
+        save_strategy="no",
+        group_by_length=True,
+        gradient_checkpointing=True,
+        fp16=False,
+        report_to=None,
+        run_name=f'{args.unlearn_method.lower()}_lr={args.lr}',
+        max_grad_norm=0.3,
+        remove_unused_columns=False,
+        load_best_model_at_end=False,
+    )
+
+    if args.unlearn_method.lower() == "gradient_ascent":
+        custom_loss = get_gradient_ascent_trainer()
+        trainer = custom_loss(
+            model=model,
+            args=training_args,
+            tokenizer=tokenizer,
+            train_dataset=dataset['train_forget'],
+            eval_dataset={"train_retain": dataset['train_retain'], "train_forget": dataset['train_forget']},
+            data_collator=collator,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            compute_metrics=compute_metrics
+        )
+
+    elif args.unlearn_method.lower() == "random_label":
+        custom_loss = get_random_label_trainer()
+        trainer = custom_loss(
+            model=model,
+            args=training_args,
+            tokenizer=tokenizer,
+            train_dataset=dataset['train'],
+            eval_dataset={"train_retain": dataset['train_retain'],
+                      "train_forget": dataset['train_forget']},
+            data_collator=collator,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            compute_metrics=compute_metrics
+        )
+
+    elif args.unlearn_method.lower() == "gradient_ascent_kl":
+        custom_loss = get_gradient_ascent_plus_kl_trainer()
+        trainer = custom_loss(
+            model=model,
+            original_logits=original_logits,
+            args=training_args,
+            tokenizer=tokenizer,
+            train_dataset=dataset['train'],
+            eval_dataset={"train_retain": dataset['train_retain'],
+                      "train_forget": dataset['train_forget']},
+            data_collator=collator,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            compute_metrics=compute_metrics
+        )
+
+    elif args.unlearn_method.lower() == "gradient_ascent_descent":
+        custom_loss = get_gradient_ascent_plus_descent_trainer()
+        trainer = custom_loss(
+            model=model,
+            args=training_args,
+            tokenizer=tokenizer,
+            train_dataset=dataset['train'],
+            eval_dataset={"train_retain": dataset['train_retain'],
+                      "train_forget": dataset['train_forget']},
+            data_collator=collator,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            compute_metrics=compute_metrics
+        )
+
+    trainer.add_callback(CustomCallback(trainer))
+    start = time.perf_counter()
+    trainer.train()
+    runtime = (time.perf_counter()-start)
+    print(f"Total training time (s): {runtime:.1f}")
+    print(f"Here are the final results:")
+    metrics = trainer.evaluate(eval_dataset={"train_retain": dataset['train_retain'], "train_forget": dataset['train_forget']})
+    print(metrics)
+    with open(os.path.join(args.output_path, 'final_results.txt'), 'w') as f:
+        f.write(f"Total training time (s): {runtime:.1f}\n")
+        for k, v in metrics.items():
+            f.write(f"{k}: {v}\n")
+
+if __name__ == "__main__":
+    args = get_args()
+    main(args)
+
+# utils.py
+import os
+import numpy as np
+from copy import deepcopy
+import evaluate
+import torch
+from transformers import TrainingArguments, TrainerState, TrainerControl, TrainerCallback
+from transformers import PreTrainedTokenizerBase
+
+# Try to use TRL collator if present
+try:
+    from trl import DataCollatorForCompletionOnly as _TRL_DATA_COLLATOR
+    _HAS_TRL_COLLATOR = True
+except Exception:
+    _TRL_DATA_COLLATOR = None
+    _HAS_TRL_COLLATOR = False
+
+
+class CompletionOnlyCollator:
+    """
+    Collator that masks prefix tokens (before response template) with -100 so only completion contributes to loss.
+    Works for raw text or already-tokenized inputs.
+    """
+    def __init__(self, response_template_ids, tokenizer: PreTrainedTokenizerBase, max_length=128):
+        self.response_template_ids = list(response_template_ids) if response_template_ids is not None else []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    @staticmethod
+    def _find_subsequence(haystack, needle):
+        if not needle:
+            return -1
+        n, m = len(haystack), len(needle)
+        for i in range(n - m + 1):
+            if haystack[i:i + m] == needle:
+                return i
+        return -1
+
+    def __call__(self, features):
+        if len(features) == 0:
+            return {}
+
+        first = features[0]
+
+        if isinstance(first, dict) and ("input_ids" in first):
+            seqs = []
+            for ex in features:
+                ids = ex["input_ids"]
+                if torch.is_tensor(ids):
+                    ids = ids.tolist()
+                seqs.append(ids)
+
+            encodings = [{"input_ids": s} for s in seqs]
+            toks = self.tokenizer.pad(
+                encodings,
+                return_tensors="pt",
+                padding=True,
+                max_length=self.max_length,
+            )
+            input_ids = toks["input_ids"]
+            attention_mask = toks.get("attention_mask", None)
+        else:
+            texts = [f["text"] if isinstance(f, dict) and "text" in f else f for f in features]
+            toks = self.tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            input_ids = toks["input_ids"]
+            attention_mask = toks.get("attention_mask", None)
+
+        labels = input_ids.clone().fill_(-100)
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+
+        for i, ids in enumerate(input_ids.tolist()):
+            pos = self._find_subsequence(ids, self.response_template_ids)
+            if pos == -1:
+                try:
+                    last_nonpad = max(j for j, tok in enumerate(ids) if tok != pad_id)
+                    labels[i, last_nonpad] = input_ids[i, last_nonpad]
+                except Exception:
+                    pass
+            else:
+                start = pos + len(self.response_template_ids)
+                if start < input_ids.shape[1]:
+                    labels[i, start:] = input_ids[i, start:]
+
+        out = {"input_ids": input_ids, "labels": labels}
+        if attention_mask is not None:
+            out["attention_mask"] = attention_mask
+        return out
+
+
+# compatibility alias (use TRL collator if available)
+DataCollatorForCompletionOnlyLM = _TRL_DATA_COLLATOR or CompletionOnlyCollator
+
+
+def get_data_path(dataset):
+    """
+    Return local dataset folder if present (preferred), otherwise return HF Hub repo id.
+    Local folder expected at ./datasets/Unlearning_<NAME>
+    """
+    dataset = dataset.lower()
+    repo_root = os.path.dirname(__file__)
+    local_base = os.path.join(repo_root, "datasets")
+    if dataset == "sst2":
+        local_path = os.path.join(local_base, "Unlearning_SST2")
+        if os.path.isdir(local_path):
+            return local_path
+        # fallback hub id
+        return "karuna-bhaila/Unlearning_SST2v3"
+    elif dataset == "yelp":
+        local_path = os.path.join(local_base, "Unlearning_Yelp_Polarity")
+        if os.path.isdir(local_path):
+            return local_path
+        return "karuna-bhaila/Unlearning_Yelp_Polarity"
+    else:
+        raise NotImplementedError(f"Unknown dataset: {dataset}")
+
+
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+
+def compute_metrics(eval_pred):
+    f1_metric = evaluate.load("f1")
+    acc_metric = evaluate.load("accuracy")
+    prec_metric = evaluate.load("precision")
+    rec_metric = evaluate.load("recall")
+
+    logits, labels = eval_pred
+    predictions = logits[:, :-1]
+    labels = labels[:, 1:]
+    mask = labels != -100
+
+    preds_flat = []
+    refs_flat = []
+    for i in range(predictions.shape[0]):
+        row_mask = mask[i]
+        # Use proper nonzero for numpy or torch
+        if isinstance(row_mask, np.ndarray):
+            idxs = np.nonzero(row_mask)[0]  # NumPy returns a tuple
+        else:
+            idxs = row_mask.nonzero(as_tuple=False).squeeze(-1)  # PyTorch tensor
+
+        if len(idxs) == 0:
+            continue
+
+        preds_flat.extend([int(x) for x in predictions[i][idxs].tolist()])
+        refs_flat.extend([int(x) for x in labels[i][idxs].tolist()])
+
+    if len(preds_flat) == 0:
+        return {"f1": 0.0, "accuracy": 0.0, "precision": 0.0, "recall": 0.0}
+
+    return {
+        "f1": f1_metric.compute(predictions=preds_flat, references=refs_flat, average="weighted")["f1"],
+        "accuracy": acc_metric.compute(predictions=preds_flat, references=refs_flat)["accuracy"],
+        "precision": prec_metric.compute(predictions=preds_flat, references=refs_flat, average="micro")["precision"],
+        "recall": rec_metric.compute(predictions=preds_flat, references=refs_flat, average="micro")["recall"],
+    }
+
+
+class CustomCallback(TrainerCallback):
+    def __init__(self, trainer) -> None:
+        super().__init__()
+        self._trainer = trainer
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        try:
+            self._trainer.evaluate(eval_dataset=self._trainer.train_dataset, metric_key_prefix="train")
+        except Exception:
+            pass
+        return deepcopy(control)
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        try:
+            if isinstance(self._trainer.eval_dataset, dict):
+                for key, ds in self._trainer.eval_dataset.items():
+                    self._trainer.evaluate(eval_dataset=ds, metric_key_prefix=f"eval_{key}")
+            else:
+                self._trainer.evaluate(eval_dataset=self._trainer.eval_dataset, metric_key_prefix="eval")
+        except Exception:
+            pass
+        return deepcopy(control)
+
+def get_logits_from_base_model(model, collator, dataset, batch_size=8, device="cuda"):
+    """
+    Run the model over dataset and return logits for all samples.
+    """
+    model.eval()
+    all_logits = {}
+    loader = torch.utils.data.DataLoader(dataset['train'], batch_size=batch_size, shuffle=False, collate_fn=collator)
+    idx = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            logits = outputs.logits.detach().cpu()
+            for i in range(logits.size(0)):
+                all_logits[idx] = logits[i]
+                idx += 1
+    return all_logits
